@@ -1,93 +1,42 @@
-name: Sync Upstream & Build APK
-
-on:
-  schedule:
-    # 每天凌晨 3:00（UTC 时间）自动检查一次上游代码
-    - cron: '0 3 * * *'
-  # 支持在 GitHub 页面上手动点击按钮立即运行
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  sync-and-build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Fork Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sync with Upstream
-        id: sync
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # 添加官方上游仓库并获取最新分支
-          git remote add upstream https://github.com/immortalwrt/homeproxy.git
-          git fetch upstream
-
-          # 自动获取默认分支名称（通常为 master）
-          BRANCH=$(git rev-parse --abbrev-ref HEAD)
-
-          # 记录当前最新提交 Hash
-          LOCAL_HASH=$(git rev-parse HEAD)
-          UPSTREAM_HASH=$(git rev-parse upstream/$BRANCH)
-
-          echo "Local commit: $LOCAL_HASH"
-          echo "Upstream commit: $UPSTREAM_HASH"
-
-          # 如果是手动触发，或者上游存在新提交，则执行合并与编译
-          if [ "$LOCAL_HASH" != "$UPSTREAM_HASH" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "has_updates=true" >> "$GITHUB_OUTPUT"
-            echo "发现上游更新，正在合并代码..."
-            git merge upstream/$BRANCH -m "Auto sync from upstream"
-            git push origin $BRANCH
-          else
-            echo "has_updates=false" >> "$GITHUB_OUTPUT"
-            echo "代码已是最新，无需合并与编译。"
-          fi
-
-      - name: Setup OpenWrt SDK & Compile APK
+- name: Setup OpenWrt SDK & Compile APK
         if: steps.sync.outputs.has_updates == 'true'
         run: |
-          # 1. 准备编译工作区，克隆并准备最新代码
           mkdir -p $HOME/build && cd $HOME/build
 
-          # 2. 下载 OpenWrt 官方支持 apk-tools 的 SDK（以 x86_64 snapshot 为例）
-          echo "正在下载 OpenWrt SDK..."
-          wget -q https://downloads.openwrt.org/snapshots/targets/x86/64/openwrt-sdk-x86-64_gcc-14.2.0_musl.Linux-x86_64.tar.zst
-          zstd -d openwrt-sdk-*.tar.zst
-          tar -xf openwrt-sdk-*.tar --strip-components=1
+          # 自动获取当前官方最新的 SDK 完整下载直链（避免硬编码文件名导致 404）
+          echo "正在抓取最新 OpenWrt SDK 链接..."
+          BASE_URL="https://downloads.openwrt.org/snapshots/targets/x86/64/"
+          SDK_FILE=$(curl -sL "$BASE_URL" | grep -oE 'openwrt-sdk-x86-64_[^"]+\.tar\.zst' | head -n 1)
 
-          # 3. 将同步后的 homeproxy 挂载进 SDK 的 package 目录
+          if [ -z "$SDK_FILE" ]; then
+            echo "未能解析到 SDK 下载链接，请检查下载目录网络状态！"
+            exit 1
+          fi
+
+          echo "下载 SDK: ${BASE_URL}${SDK_FILE}"
+          curl -fLO "${BASE_URL}${SDK_FILE}"
+
+          echo "解压 SDK..."
+          zstd -d "$SDK_FILE"
+          tar -xf *.tar --strip-components=1
+
+          # 挂载 homeproxy 源码
           cp -r ${{ github.workspace }} package/homeproxy
 
-          # 4. 更新与安装 feeds 依赖
+          # 更新 feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 5. 配置仅编译 HomeProxy 独立包
+          # 配置生成独立包
           make defconfig
           echo "CONFIG_PACKAGE_luci-app-homeproxy=m" >> .config
           echo "CONFIG_PACKAGE_luci-i18n-homeproxy-zh-cn=m" >> .config
           make defconfig
 
-          # 6. 开始编译
+          # 开始编译
           echo "开始编译 HomeProxy APK..."
           make package/homeproxy/compile -j$(nproc) V=s
 
-          # 7. 整理生成的产物
+          # 导出生成的 apk 安装包
           mkdir -p ${{ github.workspace }}/output
           find bin/packages/ -iname "*homeproxy*.apk" -exec cp {} ${{ github.workspace }}/output/ \;
-
-      - name: Upload APK Artifacts
-        if: steps.sync.outputs.has_updates == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: homeproxy-apks
-          path: output/*.apk
-          retention-days: 15
