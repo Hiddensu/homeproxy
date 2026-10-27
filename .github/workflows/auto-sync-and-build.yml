@@ -1,4 +1,57 @@
-- name: Setup OpenWrt SDK & Compile APK
+name: Sync Upstream & Build APK
+
+on:
+  schedule:
+    # 每天凌晨 3:00（UTC 时间）自动检查一次上游代码
+    - cron: '0 3 * * *'
+  # 支持在 GitHub 页面上手动点击按钮立即运行
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Fork Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync with Upstream
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 添加官方上游仓库并获取最新分支
+          git remote add upstream https://github.com/immortalwrt/homeproxy.git
+          git fetch upstream
+
+          # 自动获取默认分支名称（通常为 master）
+          BRANCH=$(git rev-parse --abbrev-ref HEAD)
+
+          # 记录当前最新提交 Hash
+          LOCAL_HASH=$(git rev-parse HEAD)
+          UPSTREAM_HASH=$(git rev-parse upstream/$BRANCH)
+
+          echo "Local commit: $LOCAL_HASH"
+          echo "Upstream commit: $UPSTREAM_HASH"
+
+          # 如果是手动触发，或者上游存在新提交，则执行合并与编译
+          if [ "$LOCAL_HASH" != "$UPSTREAM_HASH" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+            echo "发现上游更新，正在合并代码..."
+            git merge upstream/$BRANCH -m "Auto sync from upstream"
+            git push origin $BRANCH
+          else
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+            echo "代码已是最新，无需合并与编译。"
+          fi
+
+      - name: Setup OpenWrt SDK & Compile APK
         if: steps.sync.outputs.has_updates == 'true'
         run: |
           mkdir -p $HOME/build && cd $HOME/build
